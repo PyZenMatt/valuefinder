@@ -1,15 +1,44 @@
+from concurrent.futures import Future, ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk, ImageDraw
 
-from image_processing import load_grayscale_image, posterize_image, calculate_histogram
-from mask_tools import create_polygon_mask, replace_background
+from PIL import Image, ImageDraw, ImageTk
+
 from cutout_tools import generate_cutout_phases, export_cutout_phases
+from image_processing import (
+    apply_luminance_blend,
+    calculate_histogram,
+    load_grayscale_image,
+    posterize_image,
+    posterize_rgb,
+)
+from mask_tools import create_polygon_mask, replace_background
 
 # ── Zoom levels available in the main canvas ──────────────────────────────────
 ZOOM_LEVELS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
 _DEFAULT_ZOOM_IDX = 3   # 100 %
 _HIT_RADIUS = 10        # screen-pixel radius for vertex hit-detection
+
+
+def _process_color_image(
+    image: Image.Image,
+    levels: int,
+    blend_luminance: bool,
+) -> tuple[Image.Image, Image.Image]:
+    """Build raw and display-ready posterized results from an RGB image.
+
+    Args:
+        image: Source image to posterize.
+        levels: Number of output levels per channel.
+        blend_luminance: Whether to match the source color to posterized light.
+
+    Returns:
+        A tuple containing the raw posterization and the display result.
+    """
+    posterized = posterize_rgb(image, levels)
+    if blend_luminance:
+        return posterized, apply_luminance_blend(image, posterized)
+    return posterized, posterized
 
 
 class ValueStudyApp(tk.Tk):
@@ -39,14 +68,23 @@ class ValueStudyApp(tk.Tk):
 
         # ── image / posterization ──────────────────────────────────────────
         self.original_image    = None
+        self.original_image_rgb = None
         self.image_path        = None
         self.histogram_data    = None
         self._posterized_image = None
+        self._posterized_color_image = None
+        self._color_display_image = None
+        self._color_executor = ThreadPoolExecutor(max_workers=1)
+        self._color_future: Future[tuple[Image.Image, Image.Image]] | None = None
+        self._color_generation = 0
 
         # ── tonal controls ─────────────────────────────────────────────────
         self.levels_count     = tk.IntVar(value=3)
         self.threshold_vars   = []
         self.background_value = tk.IntVar(value=220)
+        self.color_mode = tk.BooleanVar(value=False)
+        self.luminance_blend = tk.BooleanVar(value=True)
+        self.color_levels = tk.IntVar(value=4)
 
         # ── selection (all coords in original image space) ─────────────────
         self.subject_polygon_points = []
@@ -63,6 +101,7 @@ class ValueStudyApp(tk.Tk):
         self._update_job  = None   # debounce handle
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
     # ─────────────────────────────────────────────────── UI construction ──
 
@@ -175,6 +214,33 @@ class ValueStudyApp(tk.Tk):
             showvalue=True,
         ).pack(padx=8, pady=(2, 6), fill=tk.X)
 
+        # ── Color ──
+        _section(sb, "Colore")
+        tk.Checkbutton(
+            sb,
+            text="Modalità Colore",
+            variable=self.color_mode,
+            command=self._on_color_settings_changed,
+            anchor=tk.W,
+        ).pack(**kw)
+        tk.Checkbutton(
+            sb,
+            text="Fusione Luminanza",
+            variable=self.luminance_blend,
+            command=self._on_color_settings_changed,
+            anchor=tk.W,
+        ).pack(**kw)
+        tk.Scale(
+            sb,
+            from_=2,
+            to=8,
+            orient=tk.HORIZONTAL,
+            variable=self.color_levels,
+            command=lambda _: self._on_color_settings_changed(),
+            label="Livelli colore",
+            showvalue=True,
+        ).pack(padx=8, pady=(2, 6), fill=tk.X)
+
     # ── Bottom panel ─────────────────────────────────────────────────────
 
     def _build_bottom_panel(self, parent):
@@ -239,7 +305,8 @@ class ValueStudyApp(tk.Tk):
 
     # ─────────────────────────────────────────────────── Image loading ──
 
-    def load_image(self):
+    def load_image(self) -> None:
+        """Load the source as RGB and grayscale for their separate workflows."""
         path = filedialog.askopenfilename(
             filetypes=[("Immagini", "*.jpg *.jpeg *.png *.bmp *.webp"),
                        ("Tutti i file", "*.*")]
@@ -249,11 +316,16 @@ class ValueStudyApp(tk.Tk):
 
         self.image_path        = path
         self.original_image    = load_grayscale_image(path)
+        with Image.open(path) as source_image:
+            self.original_image_rgb = source_image.convert("RGB")
         self.histogram_data    = calculate_histogram(self.original_image)
         self._posterized_image = None
+        self._posterized_color_image = None
+        self._color_display_image = None
 
         self.reset_selection()          # clears polygon, schedules canvas update
         self._on_thresholds_changed()   # (re)builds posterized + histogram
+        self._on_color_settings_changed()
         self.after(60, self._fit_to_window)
 
     # ──────────────────────────────────────────────────── Posterization ──
@@ -273,11 +345,64 @@ class ValueStudyApp(tk.Tk):
         self._draw_histogram()
         self._schedule_canvas_update()
 
+    def _on_color_settings_changed(self) -> None:
+        """Recompute color posterization off the Tkinter main thread."""
+        self._color_generation += 1
+        generation = self._color_generation
+        if self._color_future is not None:
+            self._color_future.cancel()
+            self._color_future = None
+
+        if self.color_mode.get() and self.original_image_rgb is not None:
+            self._posterized_color_image = None
+            self._color_display_image = None
+            self._color_future = self._color_executor.submit(
+                _process_color_image,
+                self.original_image_rgb.copy(),
+                self.color_levels.get(),
+                self.luminance_blend.get(),
+            )
+            self.after(25, self._poll_color_processing, generation)
+
+        self._schedule_canvas_update()
+
+    def _poll_color_processing(self, generation: int) -> None:
+        """Apply a completed color-processing result if it is still current."""
+        if generation != self._color_generation or self._color_future is None:
+            return
+        if not self._color_future.done():
+            self.after(25, self._poll_color_processing, generation)
+            return
+
+        future = self._color_future
+        self._color_future = None
+        try:
+            posterized, display_image = future.result()
+        except (MemoryError, ValueError) as exc:
+            self._posterized_color_image = None
+            self._color_display_image = None
+            messagebox.showerror("Errore colore", str(exc))
+            self._schedule_canvas_update()
+            return
+
+        self._posterized_color_image = posterized
+        self._color_display_image = display_image
+        self._schedule_canvas_update()
+
+    def _close(self) -> None:
+        """Stop accepting color-processing work before closing the window."""
+        self._color_generation += 1
+        self._color_executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
+
     # ──────────────────────────────────────────────── Canvas rendering ──
 
-    def _render_canvas(self, resample=Image.LANCZOS):
+    def _render_canvas(
+        self,
+        resample: Image.Resampling = Image.Resampling.LANCZOS,
+    ) -> None:
         """
-        Build and display the current frame.
+        Build and display the current frame using the selected resampling filter.
 
         Pipeline
         --------
@@ -298,7 +423,16 @@ class ValueStudyApp(tk.Tk):
         sh     = max(1, int(ih * z))
 
         mode = self.view_mode.get()
-        src  = self._posterized_image if mode != "original" else self.original_image
+        if self.color_mode.get():
+            src = (
+                self.original_image_rgb
+                if mode == "original"
+                else self._color_display_image
+            )
+            if src is None:
+                src = self.original_image_rgb
+        else:
+            src = self._posterized_image if mode != "original" else self.original_image
         if src is None:
             src = self.original_image
 
@@ -491,7 +625,8 @@ class ValueStudyApp(tk.Tk):
 
     # ─────────────────────────────────────────────────── Save image ──
 
-    def save_image(self):
+    def save_image(self) -> None:
+        """Save the selected grayscale or color result at source resolution."""
         if self.original_image is None:
             messagebox.showwarning("Nessuna immagine", "Carica prima un'immagine.")
             return
@@ -503,11 +638,26 @@ class ValueStudyApp(tk.Tk):
         if not output_path:
             return
 
-        # Always posterize at full resolution
-        thresholds = [v.get() for v in self.threshold_vars]
-        result = posterize_image(
-            self.original_image, thresholds, self.levels_count.get()
-        )
+        if self.color_mode.get():
+            if self._color_future is not None:
+                messagebox.showinfo(
+                    "Elaborazione in corso",
+                    "Attendi il completamento dell'elaborazione colore prima di salvare.",
+                )
+                return
+            if self._color_display_image is None:
+                messagebox.showwarning(
+                    "Immagine colore non pronta",
+                    "Non è disponibile un risultato colore da salvare.",
+                )
+                return
+            result = self._color_display_image.copy()
+        else:
+            # Always posterize at full resolution
+            thresholds = [v.get() for v in self.threshold_vars]
+            result = posterize_image(
+                self.original_image, thresholds, self.levels_count.get()
+            )
 
         # Apply background mask at full resolution when a closed selection exists
         if self.selection_closed and len(self.subject_polygon_points) >= 3:

@@ -5,6 +5,7 @@ ValueFinder è un'applicazione desktop Python progettata per supportare la prati
 ## Funzionalità Principali
 - Caricamento immagini in scala di grigi e RGB.
 - Posterizzazione per lo studio dei valori tonali.
+- Posterizzazione RGB selezionabile dalla sezione Colore, con fusione luminanza opzionale.
 - Generazione di maschere Cut Out progressive per la pittura a strati.
 - Esportazione in alta risoluzione.
 
