@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Test Images & Output (escludi immagini pesanti o generate)
+*.png
+*.jpg
+*.jpeg
+!tests/fixtures/*.png
+!tests/fixtures/*.jpg
+
+# Local DB/Logs
+*.log
