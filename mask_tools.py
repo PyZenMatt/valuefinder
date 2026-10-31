@@ -25,8 +25,20 @@ def replace_background(
     mask: Image.Image,
     background_value: int,
 ) -> Image.Image:
-    image_arr = np.array(image.convert("L"))
-    mask_arr = np.array(mask)
+    """Replace masked-out pixels with a solid grayscale background.
+
+    RGB input remains RGB for color-mode previews and exports; other input
+    modes retain the existing grayscale behavior.
+    """
+    mask_arr = np.asarray(mask.convert("L"))
+
+    if image.mode == "RGB":
+        image_arr = np.asarray(image)
+        bg = np.full_like(image_arr, background_value, dtype=np.uint8)
+        result = np.where(mask_arr[..., np.newaxis] > 0, image_arr, bg)
+        return Image.fromarray(result.astype(np.uint8))
+
+    image_arr = np.asarray(image.convert("L"))
 
     bg = np.full_like(image_arr, background_value, dtype=np.uint8)
     result = np.where(mask_arr > 0, image_arr, bg)
