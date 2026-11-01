@@ -305,3 +305,8 @@ Implement the smallest complete solution that satisfies the approved issue.
 Preserve existing functionality, respect architectural boundaries, verify every relevant behavior and never substitute assumptions for evidence.
 
 The Software Architect defines the technical direction. The Developer implements it. The Product Owner approves scope changes and final acceptance.
+
+## 6. Evoluzioni Architetturali (Aggiornamento Post-Feature Colore)
+- **Multithreading**: La GUI (`gui.py`) ora utilizza un worker in background per le operazioni pesanti (es. K-Means, Luminance). Qualsiasi nuova operazione che richieda più di 50ms deve essere gestita tramite questo worker, senza bloccare il thread principale di Tkinter. I risultati obsoleti devono essere scartati tramite token di generazione.
+- **Gestione RGB e L**: Il progetto ora gestisce esplicitamente sia immagini in scala di grigi (`L`) che a colori (`RGB`). `mask_tools.replace_background` deve essere in grado di gestire entrambi i formati senza degradare i colori. Il flusso Cut Out rimane rigorosamente vincolato alla scala di grigi.
+- **Dipendenze**: Le dipendenze principali sono `Pillow`, `NumPy`. Qualsiasi nuova libreria (es. `scikit-learn`, `MediaPipe`) deve essere approvata dall'Architetto prima dell'integrazione.

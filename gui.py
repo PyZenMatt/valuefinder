@@ -13,6 +13,7 @@ from image_processing import (
     posterize_rgb,
 )
 from mask_tools import create_polygon_mask, replace_background
+from segmentation_tools import generate_subject_mask
 
 # ── Zoom levels available in the main canvas ──────────────────────────────────
 ZOOM_LEVELS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
@@ -77,6 +78,9 @@ class ValueStudyApp(tk.Tk):
         self._color_executor = ThreadPoolExecutor(max_workers=1)
         self._color_future: Future[tuple[Image.Image, Image.Image]] | None = None
         self._color_generation = 0
+        self.subject_mask_ai: Image.Image | None = None
+        self._segmentation_future: Future[Image.Image] | None = None
+        self._segmentation_generation = 0
 
         # ── tonal controls ─────────────────────────────────────────────────
         self.levels_count     = tk.IntVar(value=3)
@@ -85,6 +89,7 @@ class ValueStudyApp(tk.Tk):
         self.color_mode = tk.BooleanVar(value=False)
         self.luminance_blend = tk.BooleanVar(value=True)
         self.color_levels = tk.IntVar(value=4)
+        self.segmentation_status = tk.StringVar(value="")
 
         # ── selection (all coords in original image space) ─────────────────
         self.subject_polygon_points = []
@@ -108,13 +113,17 @@ class ValueStudyApp(tk.Tk):
     def _build_ui(self):
         self._build_topbar()
 
-        content = tk.Frame(self)
+        content = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            sashrelief=tk.RAISED,
+        )
         content.pack(fill=tk.BOTH, expand=True)
 
-        self._build_sidebar(content)
-
+        sidebar = self._build_sidebar(content)
         right = tk.Frame(content)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content.add(sidebar, minsize=180, width=215)
+        content.add(right, minsize=400)
 
         # Build bottom panel before canvas so canvas gets the remaining space.
         self._build_bottom_panel(right)
@@ -163,8 +172,6 @@ class ValueStudyApp(tk.Tk):
 
     def _build_sidebar(self, parent):
         sb = tk.Frame(parent, width=215, bd=1, relief=tk.RAISED)
-        sb.pack(side=tk.LEFT, fill=tk.Y)
-        sb.pack_propagate(False)
 
         kw = dict(padx=8, pady=2, fill=tk.X)   # common pack kwargs
 
@@ -183,6 +190,21 @@ class ValueStudyApp(tk.Tk):
         tk.Button(sb, text="Chiudi selezione", command=self.close_selection).pack(**kw)
         tk.Button(sb, text="Annulla ultimo",   command=self.undo_last_point).pack(**kw)
         tk.Button(sb, text="Reset selezione",  command=self.reset_selection).pack(**kw)
+
+        _section(sb, "Intelligenza artificiale")
+        self._segment_button = tk.Button(
+            sb,
+            text="✨ Rimuovi Sfondo (AI)",
+            command=self._start_ai_segmentation,
+        )
+        self._segment_button.pack(**kw)
+        tk.Label(
+            sb,
+            textvariable=self.segmentation_status,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=195,
+        ).pack(**kw)
 
         # ── Zoom ──
         _section(sb, "Zoom")
@@ -240,6 +262,8 @@ class ValueStudyApp(tk.Tk):
             label="Livelli colore",
             showvalue=True,
         ).pack(padx=8, pady=(2, 6), fill=tk.X)
+
+        return sb
 
     # ── Bottom panel ─────────────────────────────────────────────────────
 
@@ -323,6 +347,15 @@ class ValueStudyApp(tk.Tk):
         self._posterized_color_image = None
         self._color_display_image = None
 
+        self._segmentation_generation += 1
+        if self._segmentation_future is not None:
+            self._segmentation_future.cancel()
+            self._segmentation_future = None
+        self.subject_mask_ai = None
+        self.segmentation_status.set("")
+        self._segment_button.configure(state=tk.NORMAL)
+        self.configure(cursor="")
+
         self.reset_selection()          # clears polygon, schedules canvas update
         self._on_thresholds_changed()   # (re)builds posterized + histogram
         self._on_color_settings_changed()
@@ -389,9 +422,51 @@ class ValueStudyApp(tk.Tk):
         self._color_display_image = display_image
         self._schedule_canvas_update()
 
+    def _start_ai_segmentation(self) -> None:
+        """Submit subject segmentation without blocking Tkinter's event loop."""
+        if self.original_image_rgb is None:
+            messagebox.showwarning("Nessuna immagine", "Carica prima un'immagine.")
+            return
+
+        self._segmentation_generation += 1
+        generation = self._segmentation_generation
+        self.subject_mask_ai = None
+        self.segmentation_status.set("Elaborazione AI in corso...")
+        self._segment_button.configure(state=tk.DISABLED)
+        self.configure(cursor="watch")
+        self._segmentation_future = self._color_executor.submit(
+            generate_subject_mask,
+            self.original_image_rgb.copy(),
+        )
+        self.after(25, self._poll_ai_segmentation, generation)
+        self._schedule_canvas_update()
+
+    def _poll_ai_segmentation(self, generation: int) -> None:
+        """Apply a completed segmentation result on the Tkinter main thread."""
+        if (generation != self._segmentation_generation
+                or self._segmentation_future is None):
+            return
+        if not self._segmentation_future.done():
+            self.after(25, self._poll_ai_segmentation, generation)
+            return
+
+        future = self._segmentation_future
+        self._segmentation_future = None
+        self._segment_button.configure(state=tk.NORMAL)
+        self.configure(cursor="")
+        try:
+            self.subject_mask_ai = future.result()
+        except Exception as exc:
+            self.segmentation_status.set("Errore durante la segmentazione.")
+            messagebox.showerror("Errore segmentazione AI", str(exc))
+        else:
+            self.segmentation_status.set("Maschera AI pronta")
+        self._schedule_canvas_update()
+
     def _close(self) -> None:
-        """Stop accepting color-processing work before closing the window."""
+        """Stop accepting background processing work before closing."""
         self._color_generation += 1
+        self._segmentation_generation += 1
         self._color_executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 
@@ -408,8 +483,8 @@ class ValueStudyApp(tk.Tk):
         --------
         1. Select source image (original or posterized).
         2. Scale to display size (zoom x original size) using `resample`.
-        3. In 'final' view with >=3 points: apply background replacement
-           at display scale — mask creation and numpy ops stay small.
+        3. In 'final' view, apply the manual polygon or AI mask at display
+           scale so mask creation and array operations stay small.
         4. Draw polygon overlay on top.
         5. Push to canvas.
         """
@@ -441,10 +516,20 @@ class ValueStudyApp(tk.Tk):
         # Pre-compute polygon in screen space
         spts = [(int(x * z), int(y * z)) for x, y in self.subject_polygon_points]
 
-        # Background replacement (final view, >=3 points — live preview)
-        if mode == "final" and len(spts) >= 3:
-            mask   = create_polygon_mask((sw, sh), spts)
-            scaled = replace_background(scaled, mask, self.background_value.get())
+        # A manual polygon takes precedence over the AI mask.
+        if mode == "final":
+            if len(spts) >= 3:
+                mask = create_polygon_mask((sw, sh), spts)
+            elif self.subject_mask_ai is not None:
+                mask = self.subject_mask_ai.resize(
+                    (sw, sh), Image.Resampling.NEAREST
+                )
+            else:
+                mask = None
+            if mask is not None:
+                scaled = replace_background(
+                    scaled, mask, self.background_value.get()
+                )
 
         # Polygon overlay (all view modes)
         if spts:
@@ -659,15 +744,23 @@ class ValueStudyApp(tk.Tk):
                 self.original_image, thresholds, self.levels_count.get()
             )
 
-        # Apply background mask at full resolution when a closed selection exists
+        # Apply the manual selection first, otherwise use the AI foreground.
         if self.selection_closed and len(self.subject_polygon_points) >= 3:
-            mask   = create_polygon_mask(self.original_image.size, self.subject_polygon_points)
-            result = replace_background(result, mask, self.background_value.get())
+            background_mask = create_polygon_mask(
+                self.original_image.size, self.subject_polygon_points
+            )
+        else:
+            background_mask = self.subject_mask_ai
+        if background_mask is not None:
+            result = replace_background(
+                result, background_mask, self.background_value.get()
+            )
 
         result.save(output_path)
         messagebox.showinfo("Salvata", f"Immagine salvata correttamente in {output_path}.")
 
     def export_cutout(self):
+        """Export cutout phases using the manual polygon or AI mask if available."""
         if self.original_image is None:
             messagebox.showwarning(
                 "Nessuna immagine",
@@ -690,6 +783,8 @@ class ValueStudyApp(tk.Tk):
                 self.original_image.size,
                 self.subject_polygon_points,
             )
+        else:
+            background_mask = self.subject_mask_ai
 
         try:
             phases = generate_cutout_phases(
